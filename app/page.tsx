@@ -20,10 +20,33 @@ import { money } from '@/lib/money';
 // making the citations column wide enough to push the buttons off the edge.
 const shortCode = (id: string) => id.replace(/^POL-/, '');
 
+type Sort = { key: string; dir: 'asc' | 'desc' };
+
+// Sorting is client-side. Each tab keeps its own sort so that sorting the
+// Decided tab by outcome does not quietly re-sort the review queue by a
+// column that is not even shown there.
+function sortRows(rows: any[], sort: Sort) {
+  return [...rows].sort((a, b) => {
+    let cmp: number;
+    // Amounts are bigint, which arrives in JavaScript as a string.
+    // Comparing them as text would put "9" after "10", so I convert to
+    // numbers first. Same class of trap as storing money as a float.
+    if (sort.key === 'amount_cents') {
+      cmp = Number(a.amount_cents) - Number(b.amount_cents);
+    } else {
+      cmp = String(a[sort.key] ?? '').localeCompare(String(b[sort.key] ?? ''));
+    }
+    return sort.dir === 'asc' ? cmp : -cmp;
+  });
+}
+
 export default function Console() {
   const [data, setData] = useState<any>(null);
   const [filter, setFilter] = useState('all');
   const [busy, setBusy] = useState(false);
+
+  const [reviewSort, setReviewSort] = useState<Sort>({ key: 'order_id', dir: 'asc' });
+  const [settledSort, setSettledSort] = useState<Sort>({ key: 'order_id', dir: 'asc' });
 
   // cache: 'no-store' matters here. Without it the browser served the
   // previous response and the screen never updated after an approval.
@@ -110,14 +133,33 @@ export default function Console() {
         </TabsList>
 
         {/* ---------------- REVIEW QUEUE ---------------- */}
-        <TabsContent value="review" className="w-full">
+        <TabsContent value="review" className="w-full space-y-2">
+          <SortBar
+            sort={reviewSort}
+            setSort={setReviewSort}
+            columns={[
+              ['order_id', 'Order'],
+              ['amount_cents', 'Amount'],
+              ['reason', 'Reason'],
+            ]}
+          />
+
           <Card className="w-full overflow-hidden py-0">
             <Table className="w-full table-fixed">
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
-                  <TableHead className="w-[100px]">Order</TableHead>
-                  <TableHead className="w-[100px] text-right">Amount</TableHead>
-                  <TableHead className="w-[110px]">Reason</TableHead>
+                  <TableHead className="w-[100px]">
+                    <SortHead label="Order" sortKey="order_id"
+                              sort={reviewSort} setSort={setReviewSort} />
+                  </TableHead>
+                  <TableHead className="w-[100px] text-right">
+                    <SortHead label="Amount" sortKey="amount_cents"
+                              sort={reviewSort} setSort={setReviewSort} className="ml-auto" />
+                  </TableHead>
+                  <TableHead className="w-[110px]">
+                    <SortHead label="Reason" sortKey="reason"
+                              sort={reviewSort} setSort={setReviewSort} />
+                  </TableHead>
                   <TableHead className="w-[150px]">Recommendation</TableHead>
                   <TableHead className="w-[180px]">Policies cited</TableHead>
                   <TableHead className="w-[230px] text-right">Actions</TableHead>
@@ -132,7 +174,7 @@ export default function Console() {
                   </TableRow>
                 )}
 
-                {data.review.map((r: any) => (
+                {sortRows(data.review, reviewSort).map((r: any) => (
                   <TableRow key={r.id} className="align-top">
                     <TableCell className="num text-[13px]">{r.order_id}</TableCell>
                     <TableCell className="num text-right text-[13px] font-medium">
@@ -260,15 +302,34 @@ export default function Console() {
         </TabsContent>
 
         {/* ---------------- DECIDED ---------------- */}
-        <TabsContent value="settled" className="w-full">
+        <TabsContent value="settled" className="w-full space-y-2">
+          <SortBar
+            sort={settledSort}
+            setSort={setSettledSort}
+            columns={[
+              ['order_id', 'Order'],
+              ['amount_cents', 'Amount'],
+              ['status', 'Outcome'],
+            ]}
+          />
+
           <Card className="w-full overflow-hidden py-0">
             <Table className="w-full table-fixed">
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
-                  <TableHead className="w-[110px]">Order</TableHead>
-                  <TableHead className="w-[110px] text-right">Amount</TableHead>
+                  <TableHead className="w-[110px]">
+                    <SortHead label="Order" sortKey="order_id"
+                              sort={settledSort} setSort={setSettledSort} />
+                  </TableHead>
+                  <TableHead className="w-[110px] text-right">
+                    <SortHead label="Amount" sortKey="amount_cents"
+                              sort={settledSort} setSort={setSettledSort} className="ml-auto" />
+                  </TableHead>
                   <TableHead className="w-[120px]">Reason</TableHead>
-                  <TableHead className="w-[140px]">Outcome</TableHead>
+                  <TableHead className="w-[140px]">
+                    <SortHead label="Outcome" sortKey="status"
+                              sort={settledSort} setSort={setSettledSort} />
+                  </TableHead>
                   <TableHead>Notes</TableHead>
                 </TableRow>
               </TableHeader>
@@ -280,7 +341,7 @@ export default function Console() {
                     </TableCell>
                   </TableRow>
                 )}
-                {(data.settled ?? []).map((r: any) => (
+                {sortRows(data.settled ?? [], settledSort).map((r: any) => (
                   <TableRow key={r.id}>
                     <TableCell className="num text-[13px]">{r.order_id}</TableCell>
                     <TableCell className="num text-right text-[13px]">
@@ -413,6 +474,80 @@ export default function Console() {
 }
 
 /* ---------- small pieces ---------- */
+
+// Two ways to sort, because they suit different habits: this dropdown pair
+// says out loud what is possible, and clicking a column header is faster
+// once you know. Both drive the same state.
+function SortBar({
+  sort, setSort, columns,
+}: {
+  sort: Sort;
+  setSort: (s: Sort) => void;
+  columns: [string, string][];
+}) {
+  return (
+    <div className="flex items-center gap-2">
+      <span className="text-xs text-muted-foreground">Sort by</span>
+
+      <Select value={sort.key} onValueChange={(v) => setSort({ ...sort, key: v ?? 'order_id' })}>
+        <SelectTrigger className="h-8 w-40 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          {columns.map(([key, label]) => (
+            <SelectItem key={key} value={key}>{label}</SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+
+      <Select
+        value={sort.dir}
+        onValueChange={(v) => setSort({ ...sort, dir: (v as 'asc' | 'desc') ?? 'asc' })}
+      >
+        <SelectTrigger className="h-8 w-36 text-xs">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value="asc">Ascending</SelectItem>
+          <SelectItem value="desc">Descending</SelectItem>
+        </SelectContent>
+      </Select>
+    </div>
+  );
+}
+
+function SortHead({
+  label, sortKey, sort, setSort, className = '',
+}: {
+  label: string;
+  sortKey: string;
+  sort: Sort;
+  setSort: (s: Sort) => void;
+  className?: string;
+}) {
+  const active = sort.key === sortKey;
+  return (
+    <button
+      type="button"
+      onClick={() =>
+        setSort({
+          key: sortKey,
+          // Clicking the same column flips direction; a new column starts
+          // ascending, which is what people expect.
+          dir: active && sort.dir === 'asc' ? 'desc' : 'asc',
+        })
+      }
+      className={`flex items-center gap-1 hover:text-foreground ${
+        active ? 'text-foreground' : ''
+      } ${className}`}
+    >
+      {label}
+      <span aria-hidden className="text-[10px] text-muted-foreground">
+        {active ? (sort.dir === 'asc' ? '▲' : '▼') : '↕'}
+      </span>
+    </button>
+  );
+}
 
 function Stat({ n, label, alert = false }: { n: number; label: string; alert?: boolean }) {
   return (
