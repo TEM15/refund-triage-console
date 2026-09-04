@@ -48,6 +48,16 @@ export async function GET() {
      ORDER BY id DESC LIMIT 100`
   );
 
+    // The trace for anything waiting on review, so the agent can see what
+  // each step did before deciding.
+  const steps = await q(
+    `SELECT s.refund_id, s.step, s.status, s.attempts, s.detail
+     FROM workflow_steps s
+     JOIN refund_ledger r ON r.id = s.refund_id
+     WHERE r.status = 'needs_review'
+     ORDER BY s.id`
+  );
+
   const [counts] = await q<any>(
     `SELECT
        (SELECT count(*)::int FROM refund_ledger WHERE status='needs_review') AS in_review,
@@ -57,5 +67,5 @@ export async function GET() {
        (SELECT count(*)::int FROM dead_letter)                               AS dead`
   );
 
-  return NextResponse.json({ review, traces, reconciliation, rejected, counts });
+    return NextResponse.json({ review, steps, reconciliation, rejected, counts });
 }

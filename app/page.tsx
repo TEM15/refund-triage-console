@@ -54,12 +54,15 @@ export default function Console() {
     );
   }
 
-  const recon = data.reconciliation.filter((o: any) =>
+  const recon = (data.reconciliation ?? []).filter((o: any) =>
     filter === 'all' ? true : Number(o.balance_cents) !== 0
   );
 
+  // I guard with ?? [] because my console API did not originally return
+  // this key, and one missing field took the whole page down. A single
+  // absent key should never blank the screen.
   const stepsFor = (id: number) =>
-    data.steps.filter((s: any) => Number(s.refund_id) === Number(id));
+    (data.steps ?? []).filter((s: any) => Number(s.refund_id) === Number(id));
 
   return (
     <main className="mx-auto max-w-6xl px-6 py-8">
@@ -90,25 +93,27 @@ export default function Console() {
         </Button>
       </header>
 
-      <Tabs defaultValue="review" className="mt-6">
-        <TabsList>
-          <TabsTrigger value="review">Review queue</TabsTrigger>
-          <TabsTrigger value="recon">Reconciliation</TabsTrigger>
-          <TabsTrigger value="rejected">Rejected events</TabsTrigger>
+      {/* flex-col here is deliberate: without it my shadcn version laid the
+          tab strip out beside the table instead of above it. */}
+      <Tabs defaultValue="review" className="mt-6 flex w-full flex-col gap-3">
+        <TabsList className="w-fit">
+          <TabsTrigger value="review" className="px-4 text-sm">Review queue</TabsTrigger>
+          <TabsTrigger value="recon" className="px-4 text-sm">Reconciliation</TabsTrigger>
+          <TabsTrigger value="rejected" className="px-4 text-sm">Rejected events</TabsTrigger>
         </TabsList>
 
         {/* ---------------- REVIEW QUEUE ---------------- */}
-        <TabsContent value="review" className="mt-4">
-          <Card className="overflow-hidden py-0">
-            <Table className="table-fixed">
+        <TabsContent value="review" className="w-full">
+          <Card className="w-full overflow-hidden py-0">
+            <Table className="w-full table-fixed">
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
-                  <TableHead className="w-[110px]">Order</TableHead>
-                  <TableHead className="w-[110px] text-right">Amount</TableHead>
+                  <TableHead className="w-[100px]">Order</TableHead>
+                  <TableHead className="w-[100px] text-right">Amount</TableHead>
                   <TableHead className="w-[110px]">Reason</TableHead>
-                  <TableHead className="w-[130px]">Recommendation</TableHead>
-                  <TableHead>Policies cited</TableHead>
-                  <TableHead className="w-[210px] text-right">Actions</TableHead>
+                  <TableHead className="w-[150px]">Recommendation</TableHead>
+                  <TableHead className="w-[180px]">Policies cited</TableHead>
+                  <TableHead className="w-[230px] text-right">Actions</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -135,13 +140,16 @@ export default function Console() {
                         confidence={r.model_confidence}
                       />
                     </TableCell>
-                    <TableCell>
-                      <div className="flex flex-wrap gap-1">
+                    <TableCell className="overflow-hidden">
+                      {/* min-w-0 plus overflow-hidden is what keeps these
+                          badges inside their column instead of spilling
+                          across the buttons next to them. */}
+                      <div className="flex min-w-0 flex-wrap gap-1">
                         {(r.cited_policies ?? []).map((p: string) => (
                           <Badge
                             key={p}
                             variant="outline"
-                            className="num rounded px-1.5 py-0 text-[10px] font-normal text-muted-foreground"
+                            className="num max-w-full truncate rounded px-1.5 py-0 text-[10px] font-normal text-muted-foreground"
                           >
                             {shortCode(p)}
                           </Badge>
@@ -149,12 +157,12 @@ export default function Console() {
                       </div>
                     </TableCell>
                     <TableCell className="text-right">
-                      <div className="flex justify-end gap-1.5">
+                      <div className="flex justify-end gap-1.5 whitespace-nowrap">
                         <Dialog>
-                          <DialogTrigger className="rounded-md border px-2.5 py-1 text-xs hover:bg-accent">
+                          <DialogTrigger className="h-7 shrink-0 rounded-md border px-2.5 text-xs hover:bg-accent">
                             Details
                           </DialogTrigger>
-                          <DialogContent className="max-h-[85vh] max-w-2xl overflow-y-auto">
+                          <DialogContent className="max-h-[85vh] max-w-2xl space-y-4 overflow-y-auto">
                             <DialogHeader>
                               <DialogTitle className="num text-base">
                                 {r.order_id}
@@ -196,19 +204,24 @@ export default function Console() {
                                 Workflow trace
                               </h3>
                               <div className="divide-y rounded-md border">
+                                {stepsFor(r.id).length === 0 && (
+                                  <p className="px-3 py-2 text-xs text-muted-foreground">
+                                    No steps recorded yet.
+                                  </p>
+                                )}
                                 {stepsFor(r.id).map((s: any, i: number) => (
                                   <div key={i} className="flex items-center gap-3 px-3 py-2 text-xs">
                                     <span className="num w-36 shrink-0">{s.step}</span>
                                     <span
                                       className={
                                         s.status === 'ok'
-                                          ? 'text-green-700'
-                                          : 'text-destructive'
+                                          ? 'shrink-0 text-green-700'
+                                          : 'shrink-0 text-destructive'
                                       }
                                     >
                                       {s.status}
                                     </span>
-                                    <span className="num text-muted-foreground">
+                                    <span className="num shrink-0 text-muted-foreground">
                                       {s.attempts > 1 ? `${s.attempts} attempts` : '1 attempt'}
                                     </span>
                                     <span className="num truncate text-muted-foreground">
@@ -221,12 +234,12 @@ export default function Console() {
                           </DialogContent>
                         </Dialog>
 
-                        <Button size="sm" className="h-7 px-2.5 text-xs"
+                        <Button size="sm" className="h-7 shrink-0 px-2.5 text-xs"
                                 disabled={busy} onClick={() => decide(r.id, 'approve')}>
                           Approve
                         </Button>
                         <Button size="sm" variant="outline"
-                                className="h-7 px-2.5 text-xs text-destructive hover:bg-destructive/5"
+                                className="h-7 shrink-0 px-2.5 text-xs text-destructive hover:bg-destructive/5"
                                 disabled={busy} onClick={() => decide(r.id, 'reject')}>
                           Reject
                         </Button>
@@ -240,9 +253,9 @@ export default function Console() {
         </TabsContent>
 
         {/* ---------------- RECONCILIATION ---------------- */}
-        <TabsContent value="recon" className="mt-4 space-y-3">
+        <TabsContent value="recon" className="w-full space-y-3">
           <Select value={filter} onValueChange={(v) => setFilter(v ?? 'all')}>
-            <SelectTrigger className="w-64" size="sm">
+            <SelectTrigger className="w-64">
               <SelectValue />
             </SelectTrigger>
             <SelectContent>
@@ -251,15 +264,15 @@ export default function Console() {
             </SelectContent>
           </Select>
 
-          <Card className="overflow-hidden py-0">
-            <Table className="table-fixed">
+          <Card className="w-full overflow-hidden py-0">
+            <Table className="w-full table-fixed">
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="w-[140px]">Order</TableHead>
                   <TableHead className="text-right">Charged</TableHead>
                   <TableHead className="text-right">Refunded</TableHead>
                   <TableHead className="text-right">Balance</TableHead>
-                  <TableHead className="w-[180px] text-right">Status</TableHead>
+                  <TableHead className="w-[170px] text-right">Status</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -288,7 +301,7 @@ export default function Console() {
                       >
                         {money(o.balance_cents, o.currency)}
                       </TableCell>
-                      <TableCell className="text-right">
+                      <TableCell className="text-right whitespace-nowrap">
                         {balance < 0 ? (
                           <Badge variant="destructive" className="text-[11px]">
                             over-refunded
@@ -308,9 +321,9 @@ export default function Console() {
         </TabsContent>
 
         {/* ---------------- REJECTED EVENTS ---------------- */}
-        <TabsContent value="rejected" className="mt-4">
-          <Card className="overflow-hidden py-0">
-            <Table className="table-fixed">
+        <TabsContent value="rejected" className="w-full">
+          <Card className="w-full overflow-hidden py-0">
+            <Table className="w-full table-fixed">
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="w-[160px]">Event</TableHead>
