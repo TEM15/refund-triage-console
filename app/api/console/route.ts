@@ -23,12 +23,26 @@ export async function GET() {
 
   // The workflow trace for each of those, so an agent can see exactly
   // what happened before it landed on their desk.
-  const traces = await q(
+  const steps = await q(
     `SELECT s.refund_id, s.step, s.status, s.attempts, s.detail
      FROM workflow_steps s
      JOIN refund_ledger r ON r.id = s.refund_id
      WHERE r.status = 'needs_review'
      ORDER BY s.refund_id, s.id`
+  );
+
+  // Everything that has reached a final state. Without this a refund
+  // just vanished from the queue after a decision and there was nowhere
+  // to confirm what actually happened to it.
+  const settled = await q(
+    `SELECT r.id, r.order_id, r.amount_cents, r.status, r.reason,
+            r.model_action, r.refunded_at, r.notify_state,
+            o.currency
+     FROM refund_ledger r
+     JOIN orders o ON o.order_id = r.order_id
+     WHERE r.status IN ('refunded', 'rejected', 'given_up')
+     ORDER BY r.refunded_at DESC NULLS LAST, r.id DESC
+     LIMIT 100`
   );
 
   // Charged against refunded for every order that has had any refund.
@@ -42,20 +56,12 @@ export async function GET() {
      ORDER BY order_id`
   );
 
-  // Everything I threw away, so nothing is invisible.
-  const rejected = await q(
+  // Events I could not process at all -- broken payloads, and refunds
+  // whose order never turned up. These are ingest failures, which is a
+  // completely different thing from a refund an agent rejected.
+  const discarded = await q(
     `SELECT event_id, reason, created_at FROM dead_letter
      ORDER BY id DESC LIMIT 100`
-  );
-
-    // The trace for anything waiting on review, so the agent can see what
-  // each step did before deciding.
-  const steps = await q(
-    `SELECT s.refund_id, s.step, s.status, s.attempts, s.detail
-     FROM workflow_steps s
-     JOIN refund_ledger r ON r.id = s.refund_id
-     WHERE r.status = 'needs_review'
-     ORDER BY s.id`
   );
 
   const [counts] = await q<any>(
@@ -67,5 +73,12 @@ export async function GET() {
        (SELECT count(*)::int FROM dead_letter)                               AS dead`
   );
 
-    return NextResponse.json({ review, steps, reconciliation, rejected, counts });
+  // The Cache-Control header matters. force-dynamic only stops Next.js
+  // caching this on the server; without this header the browser and the
+  // CDN happily served a stale response and the screen never updated
+  // after an approval, even though the approval itself worked.
+  return NextResponse.json(
+    { review, steps, settled, reconciliation, discarded, counts },
+    { headers: { 'Cache-Control': 'no-store, max-age=0' } }
+  );
 }

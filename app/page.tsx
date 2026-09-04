@@ -25,7 +25,13 @@ export default function Console() {
   const [filter, setFilter] = useState('all');
   const [busy, setBusy] = useState(false);
 
-  const load = () => fetch('/api/console').then(r => r.json()).then(setData);
+  // cache: 'no-store' matters here. Without it the browser served the
+  // previous response and the screen never updated after an approval.
+  const load = () =>
+    fetch('/api/console', { cache: 'no-store' })
+      .then(r => r.json())
+      .then(setData);
+
   useEffect(() => { load(); }, []);
 
   async function decide(id: number, action: string) {
@@ -85,7 +91,7 @@ export default function Console() {
               alert={data.counts.mismatches > 0}
             />
             <Dot />
-            <Stat n={data.counts.dead} label="rejected events" />
+            <Stat n={data.counts.dead} label="discarded events" />
           </p>
         </div>
         <Button size="sm" variant="outline" onClick={runPending} disabled={busy}>
@@ -98,8 +104,9 @@ export default function Console() {
       <Tabs defaultValue="review" className="mt-6 flex w-full flex-col gap-3">
         <TabsList className="w-fit">
           <TabsTrigger value="review" className="px-4 text-sm">Review queue</TabsTrigger>
+          <TabsTrigger value="settled" className="px-4 text-sm">Decided</TabsTrigger>
           <TabsTrigger value="recon" className="px-4 text-sm">Reconciliation</TabsTrigger>
-          <TabsTrigger value="rejected" className="px-4 text-sm">Rejected events</TabsTrigger>
+          <TabsTrigger value="discarded" className="px-4 text-sm">Discarded events</TabsTrigger>
         </TabsList>
 
         {/* ---------------- REVIEW QUEUE ---------------- */}
@@ -169,7 +176,7 @@ export default function Console() {
                               </DialogTitle>
                             </DialogHeader>
 
-                            <dl className="grid grid-cols-3 gap-px overflow-hidden rounded-md border bg-border text-sm">
+                            <dl className="grid grid-cols-1 gap-px overflow-hidden rounded-md border bg-border text-sm sm:grid-cols-3">
                               <Figure label="Charged" value={money(r.captured_cents, r.currency)} />
                               <Figure label="Refunded so far" value={money(r.refunded_cents, r.currency)} />
                               <Figure label="This request" value={money(r.amount_cents, r.currency)} />
@@ -252,6 +259,56 @@ export default function Console() {
           </Card>
         </TabsContent>
 
+        {/* ---------------- DECIDED ---------------- */}
+        <TabsContent value="settled" className="w-full">
+          <Card className="w-full overflow-hidden py-0">
+            <Table className="w-full table-fixed">
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead className="w-[110px]">Order</TableHead>
+                  <TableHead className="w-[110px] text-right">Amount</TableHead>
+                  <TableHead className="w-[120px]">Reason</TableHead>
+                  <TableHead className="w-[140px]">Outcome</TableHead>
+                  <TableHead>Notes</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {(data.settled ?? []).length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={5} className="py-14 text-center text-sm text-muted-foreground">
+                      Nothing decided yet. Approved and rejected refunds appear here.
+                    </TableCell>
+                  </TableRow>
+                )}
+                {(data.settled ?? []).map((r: any) => (
+                  <TableRow key={r.id}>
+                    <TableCell className="num text-[13px]">{r.order_id}</TableCell>
+                    <TableCell className="num text-right text-[13px]">
+                      {money(r.amount_cents, r.currency)}
+                    </TableCell>
+                    <TableCell className="truncate text-[13px] text-muted-foreground">
+                      {r.reason ?? '—'}
+                    </TableCell>
+                    <TableCell className="whitespace-nowrap">
+                      <Outcome status={r.status} />
+                    </TableCell>
+                    <TableCell className="text-[13px] text-muted-foreground">
+                      {/* A refund that was paid but whose notification
+                          permanently failed is a real state my system can
+                          reach. Before this tab existed it was invisible. */}
+                      {r.status === 'refunded' && r.notify_state === 'failed'
+                        ? 'Paid, but the customer notification never sent'
+                        : r.status === 'given_up'
+                        ? 'The order for this refund never arrived'
+                        : ''}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </Card>
+        </TabsContent>
+
         {/* ---------------- RECONCILIATION ---------------- */}
         <TabsContent value="recon" className="w-full space-y-3">
           <Select value={filter} onValueChange={(v) => setFilter(v ?? 'all')}>
@@ -320,25 +377,25 @@ export default function Console() {
           </Card>
         </TabsContent>
 
-        {/* ---------------- REJECTED EVENTS ---------------- */}
-        <TabsContent value="rejected" className="w-full">
+        {/* ---------------- DISCARDED EVENTS ---------------- */}
+        <TabsContent value="discarded" className="w-full">
           <Card className="w-full overflow-hidden py-0">
             <Table className="w-full table-fixed">
               <TableHeader>
                 <TableRow className="hover:bg-transparent">
                   <TableHead className="w-[160px]">Event</TableHead>
-                  <TableHead>Why it was rejected</TableHead>
+                  <TableHead>Why it was discarded</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {data.rejected.length === 0 && (
+                {(data.discarded ?? []).length === 0 && (
                   <TableRow>
                     <TableCell colSpan={2} className="py-14 text-center text-sm text-muted-foreground">
-                      Nothing has been rejected.
+                      Every event so far has been processed.
                     </TableCell>
                   </TableRow>
                 )}
-                {data.rejected.map((e: any, i: number) => (
+                {(data.discarded ?? []).map((e: any, i: number) => (
                   <TableRow key={i}>
                     <TableCell className="num text-[13px]">{e.event_id ?? '—'}</TableCell>
                     <TableCell className="text-[13px] text-muted-foreground">
@@ -393,6 +450,24 @@ function Recommendation({ action, confidence }: { action: string; confidence: nu
       <span className={`num text-xs ${confidence >= 70 ? 'text-muted-foreground' : 'text-amber-700'}`}>
         {confidence > 0 ? `${confidence}%` : 'unscored'}
       </span>
+    </span>
+  );
+}
+
+function Outcome({ status }: { status: string }) {
+  const label =
+    status === 'refunded' ? 'refunded'
+    : status === 'rejected' ? 'rejected'
+    : 'given up';
+  const colour =
+    status === 'refunded' ? 'bg-green-600'
+    : status === 'rejected' ? 'bg-red-600'
+    : 'bg-stone-400';
+
+  return (
+    <span className="flex items-center gap-2 text-[13px]">
+      <span className={`h-1.5 w-1.5 shrink-0 rounded-full ${colour}`} />
+      <span>{label}</span>
     </span>
   );
 }
