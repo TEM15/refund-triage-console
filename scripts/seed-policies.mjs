@@ -40,7 +40,9 @@ const policies = [
     body: 'If an item arrives damaged, refund the full amount paid for that item ' +
           'including shipping. The normal return window does not apply to damaged ' +
           'goods. No photographic evidence is required below 200.00 in any currency.',
-    tags: ['damaged', 'broken', 'damage', 'full refund', 'shipping'],
+    tags: ['damaged', 'broken', 'damage', 'full refund', 'shipping',
+       'smashed', 'crushed', 'dented', 'cracked', 'arrived broken',
+       'parcel', 'package', 'defective'],
   },
   {
     policy_id: 'POL-MISSING-ITEM', version: 1, status: 'active',
@@ -158,7 +160,9 @@ const policies = [
     body: 'A refund must be issued in the same currency the customer was charged in. ' +
           'Never convert between currencies when refunding, because exchange rate ' +
           'movement would mean refunding a different amount from the one captured.',
-    tags: ['currency', 'USD', 'EUR', 'GBP', 'exchange', 'same currency'],
+    tags: ['currency', 'USD', 'EUR', 'GBP', 'conversion', 'exchange',
+       'dollar', 'dollars', 'euro', 'euros', 'pound', 'pounds',
+       'convert', 'foreign'],
   },
 ];
 
