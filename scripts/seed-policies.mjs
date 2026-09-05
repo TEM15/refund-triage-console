@@ -181,4 +181,10 @@ console.log(`inserted ${policies.length} policies`);
 console.log(`active: ${policies.filter(p => p.status === 'active').length}`);
 console.log(`superseded: ${policies.filter(p => p.status === 'superseded').length}`);
 
+// Conversation history lives in Mongo alongside the policies. Indexing by refund_id so an audit lookup is fast.
+await client.db(process.env.MONGODB_DB)
+  .collection('conversations')
+  .createIndex({ refund_id: 1, created_at: 1 });
+console.log('conversation history index ready');
+
 await client.close();
