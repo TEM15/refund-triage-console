@@ -1,8 +1,5 @@
 -- ==========================================================
--- ORDERS
--- One row per order. I store all money as whole cents in a
--- bigint, never as decimal, because decimals lose accuracy
--- and the reconciliation check needs to be exact.
+-- ORDERS. All money is whole cents in a bigint.
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS orders (
   order_id        text PRIMARY KEY,
@@ -10,14 +7,13 @@ CREATE TABLE IF NOT EXISTS orders (
   subtotal_cents  bigint,
   shipping_cents  bigint,
   tax_cents       bigint,
-  captured_cents  bigint NOT NULL DEFAULT 0,  -- how much I took from the customer
-  refunded_cents  bigint NOT NULL DEFAULT 0,  -- how much I have given back so far
+  captured_cents  bigint NOT NULL DEFAULT 0,
+  refunded_cents  bigint NOT NULL DEFAULT 0,
   created_at      timestamptz,
 
-  -- This is most important line in my project.
-  -- I put the "never refund more than we charged" rule inside the
-  -- database itself. Even if I have a bug in my application code,
-  -- Postgres will refuse to save a row that breaks this rule.
+  -- The most important line in my project. The rule lives in the
+  -- database, so even a bug in my code cannot save a row where we
+  -- refunded more than we charged.
   CONSTRAINT never_over_refund
     CHECK (refunded_cents >= 0 AND refunded_cents <= captured_cents)
 );
@@ -25,88 +21,89 @@ CREATE TABLE IF NOT EXISTS orders (
 
 -- ==========================================================
 -- WEBHOOK_EVENTS
--- Every event I have ever received, one row each.
--- I made event_id the PRIMARY KEY, which means Postgres
--- physically cannot store the same event twice. That is my
--- deduplication -- it lives in the database, not in my code.
+-- event_id is the PRIMARY KEY, so the same event cannot be stored twice.
+--
+-- status is a lifecycle, not just a label:
+--   processing -> I have claimed this and am working on it
+--   done       -> fully applied, safe to skip on any retry
+--   rejected   -> permanently invalid, never retry
+--
+-- Why: recording the event and applying its change are two statements.
+-- If the function died between them, a retry saw the event as a
+-- duplicate and skipped it, losing the refund forever. Now a retry
+-- finds a STALE 'processing' row, takes it over, and finishes the job.
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS webhook_events (
   event_id     text PRIMARY KEY,
   topic        text,
   occurred_at  timestamptz,
   payload      jsonb NOT NULL,
-  status       text NOT NULL DEFAULT 'ok',   -- 'ok' or 'rejected'
-  note         text,                          -- why I rejected it
+  status       text NOT NULL DEFAULT 'processing',
+  note         text,
+  claimed_at   timestamptz NOT NULL DEFAULT now(),
   received_at  timestamptz NOT NULL DEFAULT now()
 );
 
+ALTER TABLE webhook_events ADD COLUMN IF NOT EXISTS claimed_at timestamptz NOT NULL DEFAULT now();
+ALTER TABLE webhook_events ALTER COLUMN status SET DEFAULT 'processing';
+
 
 -- ==========================================================
--- REFUND_LEDGER
--- One row per refund request. I decided this row IS the
--- workflow run as well -- it holds both the refund and how far
--- through the steps it has got. That means one less table and
--- one less join to explain.
---
--- What each status means:
---   new                -> just arrived, nothing done yet
---   waiting_for_order  -> the order has not turned up yet, try again later
---   needs_review       -> a human has to decide this one
---   approved           -> cleared to pay, but not paid yet
---   refunded           -> the money has moved. Final.
---   rejected           -> I will not pay this. Final.
---   given_up           -> I waited long enough and stopped. Final.
+-- REFUND_LEDGER. One row per refund request; this row IS the run.
+-- status: new | waiting_for_order | needs_review | approved
+--         | refunded | rejected | given_up
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS refund_ledger (
   id              bigserial PRIMARY KEY,
-
-  -- UNIQUE here is acceptance check #1 written as a database rule:
-  -- one distinct event_id can only ever produce one ledger entry.
   event_id        text NOT NULL UNIQUE,
-
   order_id        text NOT NULL,
   amount_cents    bigint NOT NULL CHECK (amount_cents > 0),
   reason          text,
   status          text NOT NULL DEFAULT 'new',
 
-  -- I save what the model said so I never have to ask it twice.
-  -- That keeps retries cheap and keeps the decision the same
-  -- every time I come back to this refund.
   model_action     text,
   model_reasoning  text,
-  model_confidence int,        -- stored 0 to 100 so it is a plain integer
+  model_confidence int,
   cited_policies   text[],
 
-  -- Retry bookkeeping.
+  -- Overall loop guard. Stops anything running forever, whatever breaks.
   attempts     int NOT NULL DEFAULT 0,
+
+  -- Separate counters, because waiting for an order and failing to send
+  -- a notification are different problems with different give-up
+  -- points. Sharing one number meant a refund that waited three times
+  -- for its order had three fewer notification attempts left.
+  order_wait_attempts int NOT NULL DEFAULT 0,
+  notify_attempts     int NOT NULL DEFAULT 0,
+
   next_try_at  timestamptz NOT NULL DEFAULT now(),
   last_error   text,
 
-  -- I track the notify step separately because it can fail long
-  -- after the money has already gone out, and those two facts
-  -- must not be mixed up.
-  notify_state text NOT NULL DEFAULT 'pending',  -- pending | sent | failed
+  -- Which worker currently holds this row, so two overlapping ticks
+  -- cannot both work on the same refund.
+  locked_by    text,
 
+  notify_state text NOT NULL DEFAULT 'pending',
   requested_at timestamptz,
   refunded_at  timestamptz
 );
 
+ALTER TABLE refund_ledger ADD COLUMN IF NOT EXISTS order_wait_attempts int NOT NULL DEFAULT 0;
+ALTER TABLE refund_ledger ADD COLUMN IF NOT EXISTS notify_attempts int NOT NULL DEFAULT 0;
+ALTER TABLE refund_ledger ADD COLUMN IF NOT EXISTS locked_by text;
+
 CREATE INDEX IF NOT EXISTS refund_status_idx ON refund_ledger(status);
-CREATE INDEX IF NOT EXISTS refund_next_try_idx ON refund_ledger(next_try_at);
+CREATE INDEX IF NOT EXISTS refund_order_idx  ON refund_ledger(order_id);
 
 
 -- ==========================================================
--- WORKFLOW_STEPS
--- The trace I show in the console. One row per (refund, step).
--- I made (refund_id, step) UNIQUE so that writing the same step
--- again just updates it instead of piling up duplicate rows.
+-- WORKFLOW_STEPS -- the trace shown in the console.
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS workflow_steps (
   id         bigserial PRIMARY KEY,
   refund_id  bigint NOT NULL REFERENCES refund_ledger(id) ON DELETE CASCADE,
-  step       text NOT NULL,   -- load_order | check_eligibility | decide
-                              -- | issue_refund | notify
-  status     text NOT NULL,   -- ok | failed
+  step       text NOT NULL,
+  status     text NOT NULL,
   attempts   int NOT NULL DEFAULT 1,
   detail     text,
   updated_at timestamptz NOT NULL DEFAULT now(),
@@ -115,10 +112,7 @@ CREATE TABLE IF NOT EXISTS workflow_steps (
 
 
 -- ==========================================================
--- DEAD_LETTER
--- Events I refused to process. I keep them so that nothing ever
--- disappears silently -- if I throw something away, I can show
--- exactly what it was and why.
+-- DEAD_LETTER -- everything I refused, so nothing vanishes silently.
 -- ==========================================================
 CREATE TABLE IF NOT EXISTS dead_letter (
   id         bigserial PRIMARY KEY,
