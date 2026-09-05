@@ -1,10 +1,11 @@
-import { db } from './mongo';
+import { db } from './mongo.ts';
 
 export type Policy = {
   policy_id: string;
   version: number;
   title: string;
   body: string;
+  status?: string;
 };
 
 /**
@@ -68,12 +69,13 @@ export async function findPolicies(input: {
   for (const doc of [...found, ...alwaysInclude]) {
     if (seen.has(doc.policy_id)) continue;
     seen.add(doc.policy_id);
-    merged.push({
-      policy_id: doc.policy_id,
-      version: doc.version,
-      title: doc.title,
-      body: doc.body,
-    });
+merged.push({
+  policy_id: doc.policy_id,
+  version: doc.version,
+  title: doc.title,
+  body: doc.body,
+  status: doc.status,
+} as Policy);
   }
   return merged;
 }

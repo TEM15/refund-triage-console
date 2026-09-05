@@ -1,6 +1,7 @@
 {
   "name": "refund-triage-console",
   "version": "0.1.0",
+  "type": "module",
   "private": true,
   "scripts": {
   "dev": "next dev",
@@ -11,7 +12,7 @@
   "migrate": "node --env-file=.env.local scripts/migrate.mjs",
   "reset": "node --env-file=.env.local scripts/reset.mjs",
   "policies": "node --env-file=.env.local scripts/seed-policies.mjs",
-  "eval": "node --env-file=.env.local scripts/eval-retrieval.mjs",
+  "eval": "node --env-file=.env.local scripts/eval-retrieval.ts",
   "verify": "node --env-file=.env.local scripts/verify.mjs",
   "replay": "node --env-file=.env.local scripts/replay.mjs"
 },
