@@ -211,7 +211,7 @@ export default function Console() {
                           <DialogTrigger className="h-7 shrink-0 rounded-md border px-2.5 text-xs hover:bg-accent">
                             Details
                           </DialogTrigger>
-                          <DialogContent className="max-h-[85vh] max-w-2xl space-y-4 overflow-y-auto">
+                          <DialogContent className="max-h-[85vh] max-w-3xl space-y-4 overflow-y-auto">
                             <DialogHeader>
                               <DialogTitle className="num text-base">
                                 {r.order_id}
@@ -222,6 +222,11 @@ export default function Console() {
                               <Figure label="Charged" value={money(r.captured_cents, r.currency)} />
                               <Figure label="Refunded so far" value={money(r.refunded_cents, r.currency)} />
                               <Figure label="This request" value={money(r.amount_cents, r.currency)} />
+                              <Figure label="Shipping" value={money(r.shipping_cents ?? 0, r.currency)} />
+                              <Figure
+                                  label="Order date"
+                                  value={r.created_at ? new Date(r.created_at).toLocaleDateString() : 'unknown'}
+                              />
                             </dl>
 
                             <section>

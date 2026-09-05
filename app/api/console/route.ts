@@ -14,7 +14,8 @@ export async function GET() {
     `SELECT r.id, r.order_id, r.amount_cents, r.reason,
             r.model_action, r.model_reasoning, r.model_confidence,
             r.cited_policies,
-            o.currency, o.captured_cents, o.refunded_cents
+            o.currency, o.captured_cents, o.refunded_cents,
+            o.shipping_cents, o.created_at
      FROM refund_ledger r
      JOIN orders o ON o.order_id = r.order_id
      WHERE r.status = 'needs_review'
