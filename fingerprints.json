@@ -1,0 +1,26 @@
+[
+  {
+    "label": "pass1-sequential",
+    "events": 741,
+    "ledger": 239,
+    "paid": 77,
+    "review": 159,
+    "total": "530985"
+  },
+  {
+    "label": "pass2-duplicate",
+    "events": 741,
+    "ledger": 239,
+    "paid": 77,
+    "review": 159,
+    "total": "530985"
+  },
+  {
+    "label": "pass3-parallel",
+    "events": 741,
+    "ledger": 239,
+    "paid": 78,
+    "review": 158,
+    "total": "500857"
+  }
+]
