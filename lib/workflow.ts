@@ -1,19 +1,13 @@
 import { q } from './db';
 import { findPolicies } from './policy';
 import { decide } from './llm';
+import { recordConversation } from './conversation';
 
-// I stop after this many attempts. This is what stops the ord_9999
-// events (a refund for an order that never exists) from retrying
-// forever, which is acceptance check number four.
-const GIVE_UP_AFTER = 6;
+const GIVE_UP_WAITING_FOR_ORDER = 6;   // separate counters, because
+const GIVE_UP_NOTIFYING         = 6;   // these are different problems
+const HARD_STOP                 = 20;  // nothing runs forever, whatever breaks
 
-
-/**
- * Saves one step of the trace shown in the console.
- * Because (refund_id, step) is UNIQUE, writing the same step again
- * just updates the existing row and bumps its attempt counter,
- * instead of piling up duplicate rows.
- */
+/** Save one step of the trace. Writing the same step again just updates it. */
 async function step(refundId: string, name: string, status: string, detail = '') {
   await q(
     `INSERT INTO workflow_steps (refund_id, step, status, detail)
@@ -27,80 +21,79 @@ async function step(refundId: string, name: string, status: string, detail = '')
   );
 }
 
-/** Pushes a refund's next attempt a few seconds into the future. */
-async function retryLater(refundId: string, status: string, error = '') {
-  await q(
-    `UPDATE refund_ledger
-     SET status=$2, last_error=$3, next_try_at = now() + interval '5 seconds'
-     WHERE id=$1`,
-    [refundId, status, error]
+/**
+ * Every status change goes through here so it carries the ownership
+ * check. If another tick took this refund over while I was working, my
+ * update matches nothing and I stop quietly instead of fighting it.
+ */
+async function setStatus(
+  refundId: string, workerId: string, fields: string, params: any[] = []
+): Promise<boolean> {
+  const rows = await q(
+    `UPDATE refund_ledger SET ${fields}
+     WHERE id = $1 AND (locked_by = $2 OR locked_by IS NULL)
+     RETURNING id`,
+    [refundId, workerId, ...params]
   );
+  return rows.length > 0;
 }
 
 
 // =================================================================
-// Runs one refund through the five steps the assessment asks for:
-//
+// Run one refund through the five steps:
 //   load order -> check eligibility -> decide -> issue refund -> notify
 //
-// I wrote this so it is safe to call over and over on the same
-// refund. Every step either has already been done (so it gets
-// skipped) or is written in a way where repeating it changes nothing.
-// That is what makes retries safe.
+// Safe to call over and over. Every step is either already done and
+// skipped, or written so that repeating it changes nothing.
 // =================================================================
-export async function runRefund(refundId: string) {
-
+export async function runRefund(refundId: string, workerId = 'manual') {
   const [r] = await q<any>(`SELECT * FROM refund_ledger WHERE id=$1`, [refundId]);
   if (!r) return;
 
-  // Nothing to do for refunds that are already finished, except a
-  // notification I still owe someone.
   if (['rejected', 'given_up', 'needs_review'].includes(r.status)) return;
   if (r.status === 'refunded' && r.notify_state !== 'pending') return;
 
+  if (r.attempts > HARD_STOP) {
+    await setStatus(refundId, workerId,
+      `status='given_up', last_error='exceeded the hard attempt limit', locked_by=NULL`);
+    return;
+  }
 
-  // ---- STEP 1: LOAD ORDER --------------------------------------
-  const [order] = await q<any>(
-    `SELECT * FROM orders WHERE order_id=$1`, [r.order_id]
-  );
+  // ---- STEP 1: load the order ---------------------------------
+  const [order] = await q<any>(`SELECT * FROM orders WHERE order_id=$1`, [r.order_id]);
 
   if (!order || Number(order.captured_cents) === 0) {
-    // Two completely different situations look identical to me here:
-    //   a) the order is genuinely arriving later, because events come
-    //      out of order and this is normal
-    //   b) the order does not exist at all, like ord_9999 in the test
-    //      data
-    //
-    // I cannot tell them apart from the outside. So I wait -- but only
-    // a limited number of times. That satisfies both requirements at
-    // once: I never drop a refund that arrived early, and I never
-    // retry a broken one forever.
-    if (r.attempts >= GIVE_UP_AFTER) {
-      await step(refundId, 'load_order', 'failed', 'order never arrived');
-      await q(`UPDATE refund_ledger SET status='given_up' WHERE id=$1`, [refundId]);
-      await q(
-        `INSERT INTO dead_letter (event_id, reason) VALUES ($1, $2)`,
-        [r.event_id, 'order never arrived after ' + GIVE_UP_AFTER + ' attempts']
-      );
+    // Two very different situations look identical here: the order is
+    // genuinely coming later, or it does not exist at all (ord_9999).
+    // I cannot tell them apart, so I wait -- but a bounded number of
+    // times. That satisfies BOTH "don't drop early arrivals" AND
+    // "don't retry broken events forever". And if the order does turn
+    // up later, the webhook revives this refund even from 'given_up'.
+    const waits = Number(r.order_wait_attempts) + 1;
+
+    if (waits >= GIVE_UP_WAITING_FOR_ORDER) {
+      await step(refundId, 'load_order', 'failed', 'the order never arrived');
+      await setStatus(refundId, workerId,
+        `status='given_up', order_wait_attempts=$3, locked_by=NULL`, [waits]);
+      await q(`INSERT INTO dead_letter (event_id, reason) VALUES ($1,$2)`,
+              [r.event_id, 'order never arrived']);
       return;
     }
-    await retryLater(refundId, 'waiting_for_order', 'order not here yet');
+
+    await setStatus(refundId, workerId,
+      `status='waiting_for_order', order_wait_attempts=$3,
+       last_error='order is not here yet',
+       next_try_at = now() + interval '5 seconds', locked_by=NULL`, [waits]);
     return;
   }
   await step(refundId, 'load_order', 'ok', order.order_id);
 
-
-  // ---- STEPS 2 AND 3: ELIGIBILITY AND DECISION -----------------
-  // If model_action is already saved on the row, the model has
-  // answered this before. I reuse the saved answer instead of paying
-  // for another call, and more importantly the decision stays the
-  // same across retries instead of possibly flipping.
+  // ---- STEPS 2 and 3: eligibility and the decision -------------
+  // If model_action is already saved, the AI has answered before and I
+  // reuse it. Keeps retries cheap and keeps the decision stable.
   let action = r.model_action;
 
   if (!action) {
-    // Eligibility comes from the policy documents, not from a chain of
-    // if statements in here. That is what the assessment asks for and
-    // it also means the rules can change without me changing code.
     const policies = await findPolicies({
       reason: r.reason,
       currency: order.currency,
@@ -108,118 +101,129 @@ export async function runRefund(refundId: string) {
     await step(refundId, 'check_eligibility', 'ok',
                policies.map(p => p.policy_id).join(', '));
 
-    const d = await decide({
+    // My policies reason about "within 45 days of the order date" and
+    // "refund the shipping charge", but my first prompt sent neither
+    // the date nor the shipping amount. I was asking the model to apply
+    // a date rule with no dates, so it kept -- correctly -- answering
+    // "review, the policies do not establish this". Two thirds of my
+    // refunds ended up in the review queue because of it.
+    const daysSinceOrder = order.created_at && r.requested_at
+      ? Math.max(0, Math.floor(
+          (Date.parse(r.requested_at) - Date.parse(order.created_at)) / 86400000))
+      : null;
+
+    const decision = await decide({
       order,
       amountCents: Number(r.amount_cents),
       reason: r.reason,
       policies,
+      daysSinceOrder,
+      shippingCents: order.shipping_cents === null ? null : Number(order.shipping_cents),
     });
 
     await q(
       `UPDATE refund_ledger
-       SET model_action=$2, model_reasoning=$3,
-           model_confidence=$4, cited_policies=$5
+       SET model_action=$2, model_reasoning=$3, model_confidence=$4, cited_policies=$5
        WHERE id=$1`,
-      [refundId, d.action, d.reasoning,
-       Math.round(d.confidence * 100), d.cited_policy_ids]
+      [refundId, decision.action, decision.reasoning,
+       Math.round(decision.confidence * 100), decision.cited_policy_ids]
     );
     await step(refundId, 'decide', 'ok',
-               `${d.action} at ${Math.round(d.confidence * 100)}% confidence`);
-    action = d.action;
+               `${decision.action} (${Math.round(decision.confidence * 100)}%)`);
+
+    // The brief assigns conversation history to Mongo alongside the
+    // policy documents. This is where it gets written.
+    await recordConversation({
+      refund_id: Number(refundId),
+      order_id: r.order_id,
+      prompt_facts: {
+        currency: order.currency,
+        captured_cents: Number(order.captured_cents),
+        refunded_cents: Number(order.refunded_cents),
+        requested_cents: Number(r.amount_cents),
+        shipping_cents: order.shipping_cents === null ? null : Number(order.shipping_cents),
+        days_since_order: daysSinceOrder,
+        reason: r.reason,
+      },
+      policies_supplied: policies.map(p => ({ policy_id: p.policy_id, version: p.version })),
+      decision,
+      source: 'model',
+    });
+
+    action = decision.action;
   }
 
-  if (action === 'reject') {
-    await q(`UPDATE refund_ledger SET status='rejected' WHERE id=$1`, [refundId]);
+  if (action === 'review' || action === 'reject') {
+    // The brief says "Anything the workflow will not approve on its own
+    // goes to a review queue." So a model 'reject' goes to a human to
+    // confirm rather than being refused automatically -- turning down
+    // someone's money is a decision worth a person seeing.
+    //
+    // The one exception is in lib/llm.ts: if the amount exceeds the
+    // remaining balance, that is arithmetic rather than judgement, and
+    // it is rejected outright.
+    await setStatus(refundId, workerId, `status='needs_review', locked_by=NULL`);
     return;
   }
 
-  if (action === 'review') {
-    // Anything the workflow will not approve on its own goes into the
-    // review queue for a human, which is what the assessment asks for.
-    await q(`UPDATE refund_ledger SET status='needs_review' WHERE id=$1`, [refundId]);
-    return;
-  }
+  const stillMine = await setStatus(refundId, workerId, `status='approved'`);
+  if (!stillMine) return;   // another worker took it over; stop cleanly
 
-  // I mark it cleared for payment. issueRefund below only pays rows
-  // that are in this exact state, and that is what makes the payment
-  // happen exactly once.
-  await q(
-    `UPDATE refund_ledger SET status='approved'
-     WHERE id=$1 AND status IN ('new','waiting_for_order')`,
-    [refundId]
-  );
-
-
-  // ---- STEP 4: ISSUE REFUND (the money) ------------------------
+  // ---- STEP 4: move the money ---------------------------------
   const paid = await issueRefund(refundId);
   await step(refundId, 'issue_refund', paid.ok ? 'ok' : 'failed', paid.note);
-
   if (!paid.ok) {
-    await q(
-      `UPDATE refund_ledger SET status='rejected', last_error=$2 WHERE id=$1`,
-      [refundId, paid.note]
-    );
+    await setStatus(refundId, workerId,
+      `status='rejected', last_error=$3, locked_by=NULL`, [paid.note]);
     return;
   }
 
-
-  // ---- STEP 5: NOTIFY ------------------------------------------
+  // ---- STEP 5: notify -----------------------------------------
   try {
     await sendNotification();
-    await q(`UPDATE refund_ledger SET notify_state='sent' WHERE id=$1`, [refundId]);
+    await setStatus(refundId, workerId, `notify_state='sent', locked_by=NULL`);
     await step(refundId, 'notify', 'ok');
-
   } catch (e: any) {
-    await step(refundId, 'notify', 'failed', e.message);
+    const tries = Number(r.notify_attempts) + 1;
+    await step(refundId, 'notify', 'failed', `${e.message} (attempt ${tries})`);
 
-    if (r.attempts >= GIVE_UP_AFTER) {
-      // I stop trying to send the notification. The refund itself
-      // still stands -- a failed email is not a reason to un-pay
-      // someone, and it is definitely not a reason to pay them again.
-      await q(`UPDATE refund_ledger SET notify_state='failed' WHERE id=$1`, [refundId]);
+    if (tries >= GIVE_UP_NOTIFYING) {
+      // I stop trying to send the message. The refund still stands -- a
+      // message not sending is not a reason to take money back.
+      await setStatus(refundId, workerId,
+        `notify_state='failed', notify_attempts=$3, locked_by=NULL`, [tries]);
       return;
     }
 
-    // Retry later. On the next attempt the workflow comes back through
-    // issueRefund, which will find status='refunded' instead of
-    // 'approved', match nothing, and do nothing. That is the whole
+    // Retry later. The next attempt comes back through issueRefund,
+    // finds status='refunded', and does nothing. That is the whole
     // reason a failed notification cannot cause a second payout.
-    await retryLater(refundId, 'refunded', e.message);
+    await setStatus(refundId, workerId,
+      `notify_attempts=$3, last_error=$4,
+       next_try_at = now() + interval '5 seconds', locked_by=NULL`,
+      [tries, e.message]);
   }
 }
 
 
 // =================================================================
-// THE MONEY STEP. It is one SQL statement, and that is the point.
+// THE MONEY STEP -- one SQL statement, and that is the point.
 //
-// Everything inside a single SQL statement either all happens or none
-// of it happens. So I do not need to write an explicit transaction
-// with BEGIN and COMMIT -- Postgres already gives me that here.
+// Everything inside a single statement either all happens or none of it
+// does, so I need no explicit transaction.
 //
-// How it works, top to bottom:
+// The WITH block claims the refund by moving it from 'approved' to
+// 'refunded'. If someone already claimed it, that matches nothing, the
+// main UPDATE has no rows, and no money moves. That is what makes
+// paying twice impossible.
 //
-// 1. The WITH block (called a CTE) tries to claim the ledger row by
-//    moving it from 'approved' to 'refunded'. If some earlier attempt
-//    already did that, this matches nothing.
-//
-// 2. The main UPDATE adds the amount to the order's refunded total,
-//    but only FROM the rows the claim produced. So if the claim
-//    matched nothing, no money moves. That is what makes paying twice
-//    impossible.
-//
-// 3. The main UPDATE locks the order row while it runs. If two
-//    refunds for the same order arrive at the same moment, Postgres
-//    handles them one after the other, and the second one reads the
-//    total the first one just wrote.
-//
-// 4. If the new total would go over what was charged, the CHECK
-//    constraint on the orders table rejects the whole statement --
-//    which also undoes the claim in step 1, because it is all one
-//    statement. So the refund stays 'approved' and I mark it rejected.
+// If the claim succeeds, the main UPDATE adds to the order's refunded
+// total. That UPDATE locks the order row, so two refunds for the same
+// order are handled one after the other. If the new total would exceed
+// what was charged, the CHECK constraint rejects the whole statement --
+// which undoes the claim too, because it is all one statement.
 // =================================================================
-export async function issueRefund(
-  refundId: string
-): Promise<{ ok: boolean; note: string }> {
+export async function issueRefund(refundId: string): Promise<{ ok: boolean; note: string }> {
   try {
     const rows = await q(
       `WITH claim AS (
@@ -237,29 +241,23 @@ export async function issueRefund(
     );
 
     if (rows.length === 0) {
-      // Already refunded on an earlier attempt. Nothing happened, and
-      // that counts as success, not failure.
-      return { ok: true, note: 'already refunded, nothing to do' };
+      // Already refunded on an earlier attempt. Nothing to do, and that
+      // counts as success, not failure.
+      return { ok: true, note: 'already refunded, skipped' };
     }
     return { ok: true, note: 'refund applied' };
 
   } catch (err: any) {
-    // 23514 is the Postgres error code for "a CHECK constraint said no".
-    // Getting here means my never_over_refund rule did its job.
+    // 23514 is Postgres's code for "a CHECK constraint said no".
     if (err?.code === '23514') {
-      return { ok: false, note: 'would refund more than was charged' };
+      return { ok: false, note: 'this would refund more than was charged' };
     }
     throw err;
   }
 }
 
 
-/**
- * A pretend notification that fails about fifteen percent of the time,
- * exactly as the assessment asks for. This is deliberate, not a bug.
- */
+/** A fake notification that fails about 15% of the time, as the brief requires. */
 async function sendNotification() {
-  if (Math.random() < 0.15) {
-    throw new Error('notification service timed out');
-  }
+  if (Math.random() < 0.15) throw new Error('notification service timed out');
 }
