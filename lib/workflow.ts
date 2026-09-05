@@ -166,16 +166,31 @@ export async function runRefund(refundId: string, workerId = 'manual') {
     return;
   }
 
-  const stillMine = await setStatus(refundId, workerId, `status='approved'`);
-  if (!stillMine) return;   // another worker took it over; stop cleanly
+   // ---- STEP 4: move the money ---------------------------------
+  // Only if the money has not already moved. A refund that is already
+  // 'refunded' and is back here only to retry its notification must NOT
+  // be reset to 'approved' -- that would let issueRefund claim it and
+  // pay a second time. The status guard in this UPDATE is the whole
+  // point; a plain assignment reintroduces the double payment.
+  if (r.status !== 'refunded') {
+    const claimed = await q(
+      `UPDATE refund_ledger SET status='approved'
+       WHERE id = $1
+         AND status IN ('new','waiting_for_order','approved')
+         AND (locked_by = $2 OR locked_by IS NULL)
+       RETURNING id`,
+      [refundId, workerId]
+    );
+    if (claimed.length === 0) return;   // someone else has it; stop cleanly
 
-  // ---- STEP 4: move the money ---------------------------------
-  const paid = await issueRefund(refundId);
-  await step(refundId, 'issue_refund', paid.ok ? 'ok' : 'failed', paid.note);
-  if (!paid.ok) {
-    await setStatus(refundId, workerId,
-      `status='rejected', last_error=$3, locked_by=NULL`, [paid.note]);
-    return;
+    const paid = await issueRefund(refundId);
+    await step(refundId, 'issue_refund', paid.ok ? 'ok' : 'failed', paid.note);
+
+    if (!paid.ok) {
+      await setStatus(refundId, workerId,
+        `status='rejected', last_error=$3, locked_by=NULL`, [paid.note]);
+      return;
+    }
   }
 
   // ---- STEP 5: notify -----------------------------------------
