@@ -12,23 +12,32 @@ const lines = readFileSync('events.ndjson', 'utf8').trim().split('\n');
 console.log(`Sending ${lines.length} events to ${url} with ${workers} worker(s)...`);
 
 let sent = 0;
+const failures = [];
 
 async function send(line) {
-  // I ignore failures here on purpose. A dropped request is fine --
-  // the point of this test is that nothing gets corrupted, not that
-  // every single post succeeds.
-  await fetch(`${url}/api/webhooks/orders`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: line,
-  }).catch(() => {});
+  try {
+    const res = await fetch(`${url}/api/webhooks/orders`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: line,
+    });
+    // 400 is expected for the deliberately broken events, so it is not
+    // a failure. 5xx and network errors are.
+    if (res.status >= 500) {
+      failures.push({ id: JSON.parse(line).event_id, status: res.status });
+    }
+  } catch (e) {
+    // My first version swallowed these with .catch(() => {}). If 200
+    // posts had failed, my counts would have been short and I would
+    // have gone hunting for a deduplication bug that did not exist.
+    // Silently discarding errors during the test that proves
+    // correctness defeats the test.
+    failures.push({ id: JSON.parse(line).event_id, status: 'network', error: String(e) });
+  }
   sent++;
   if (sent % 100 === 0) console.log(`  sent ${sent}/${lines.length}`);
 }
 
-// Each "worker" takes the next line off a shared list, so several
-// requests really are in flight at the same time. That is the
-// concurrency the brief tells me to test.
 const queue = [...lines];
 await Promise.all(
   Array.from({ length: workers }, async () => {
@@ -36,15 +45,33 @@ await Promise.all(
   })
 );
 
-console.log('Ingest finished. Draining the workflow queue...');
+if (failures.length) {
+  console.error(`\n!! ${failures.length} request(s) FAILED. First five:`);
+  console.table(failures.slice(0, 5));
+  console.error('These must be zero before the replay result means anything.\n');
+} else {
+  console.log('\nAll requests completed with no server errors.');
+}
 
-// I call the tick endpoint over and over until nothing is left to do.
+console.log('Draining the workflow queue...');
+
+let idle = 0;
 while (true) {
   const res = await fetch(`${url}/api/workflow/tick?limit=25`, { method: 'POST' });
   const data = await res.json();
   console.log(`  processed ${data.processed}, remaining ${data.remaining}`);
   if (data.remaining === 0) break;
+
+  // Rows waiting on their retry delay still count as remaining, so
+  // processing zero for a few rounds is normal. Stop only if it never
+  // moves at all.
+  idle = data.processed === 0 ? idle + 1 : 0;
+  if (idle > 40) {
+    console.error('Queue stopped making progress. Something is stuck.');
+    break;
+  }
   await new Promise(r => setTimeout(r, 2000));
 }
 
 console.log('Done.');
+process.exit(failures.length ? 1 : 0);
